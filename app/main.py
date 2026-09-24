@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
-from . import clock, merkle
+from . import clock, intervals, merkle
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, DeadlineExtension, Event, Reveal, Settlement
@@ -41,6 +41,9 @@ from .schemas import (
     EventOut,
     EventSnapshotOut,
     HashOut,
+    IntervalReportEntryOut,
+    IntervalReportInvalidOut,
+    IntervalReportOut,
     MerkleProofOut,
     MerkleProofStep,
     MerkleProofVerifyRequest,
@@ -1277,6 +1280,102 @@ def get_settlement(event_id: UUID, db: Session = Depends(get_db)):
         db.query(Settlement).filter(Settlement.event_id == event.id).one_or_none()
     )
     return settlement_out(event.id, settlement)
+
+
+# --------------------------------------------------------------------------- #
+# 数值区间预测报告
+# --------------------------------------------------------------------------- #
+
+@app.get("/events/{event_id}/interval-report", response_model=IntervalReportOut)
+def get_interval_report(event_id: UUID, db: Session = Depends(get_db)):
+    """对已结算事件生成数值区间预测报告（纯只读，不修改任何数据）。
+
+    - 仅已结算事件可生成：未结算返回 409 INTERVAL_REPORT_NOT_SETTLED；
+    - 结算标准结果必须是有限十进制数，否则返回
+      422 STANDARD_RESULT_NOT_FINITE_DECIMAL；
+    - 每条已揭示原文按「下界..上界」严格解析为两个有限十进制数
+      （不允许空白 / Infinity / NaN；下界不得大于上界），解析失败者
+      单独列入 invalid 并注明原因；从未揭示的承诺单独计数；
+    - 覆盖判定为闭区间（下界 <= 标准结果 <= 上界），用 decimal.Decimal
+      精确计算，不经过浮点；区间宽度 = 上界 - 下界，同为精确十进制；
+    - 命中者按 (区间宽度, 承诺提交时间, 承诺 ID) 升序排名（rank 从 1
+      开始）；未命中者按 (承诺提交时间, 承诺 ID) 列出但不排名
+      （rank 为 null）；
+    - 响应回显结算时固化的 correct / incorrect / unrevealed 计数，
+      既有结算结果不被本接口修改。
+    """
+    event = get_event_or_404(db, event_id)
+    settlement = (
+        db.query(Settlement).filter(Settlement.event_id == event.id).one_or_none()
+    )
+    if settlement is None:
+        raise api_error(
+            409,
+            "INTERVAL_REPORT_NOT_SETTLED",
+            f"数值区间报告仅对已结算事件生成：事件 {event_id} 尚未结算",
+        )
+
+    standard = intervals.parse_finite_decimal(settlement.standard_result)
+    if standard is None:
+        raise api_error(
+            422,
+            "STANDARD_RESULT_NOT_FINITE_DECIMAL",
+            f"结算标准结果 {settlement.standard_result!r} 不是有限十进制数，"
+            "无法生成数值区间报告",
+        )
+
+    rows = (
+        db.query(Commitment, Reveal)
+        .outerjoin(Reveal, Reveal.commitment_id == Commitment.id)
+        .filter(Commitment.event_id == event.id)
+        .all()
+    )
+    revealed = [
+        (commitment.id, as_utc(commitment.created_at), reveal.original_text)
+        for commitment, reveal in rows
+        if reveal is not None
+    ]
+    unrevealed_count = sum(1 for _, reveal in rows if reveal is None)
+    report = intervals.build_interval_report(standard, revealed, unrevealed_count)
+
+    def entry_out(entry: intervals.IntervalEntry, rank: int | None) -> IntervalReportEntryOut:
+        return IntervalReportEntryOut(
+            commitment_id=entry.commitment_id,
+            committed_at=entry.committed_at,
+            lower_bound=entry.lower_text,
+            upper_bound=entry.upper_text,
+            width=str(entry.width),
+            hit=entry.hit,
+            rank=rank,
+        )
+
+    return IntervalReportOut(
+        event_id=event.id,
+        generated_at=now_utc(),
+        standard_result=settlement.standard_result,
+        settled_at=as_utc(settlement.created_at),
+        correct_count=settlement.correct_count,
+        incorrect_count=settlement.incorrect_count,
+        unrevealed_count=settlement.unrevealed_count,
+        commitment_count=len(rows),
+        revealed_count=len(revealed),
+        unrevealed_commitment_count=report.unrevealed_count,
+        valid_interval_count=len(report.hits) + len(report.misses),
+        hit_count=len(report.hits),
+        miss_count=len(report.misses),
+        invalid_count=len(report.invalid),
+        hits=[entry_out(e, i + 1) for i, e in enumerate(report.hits)],
+        misses=[entry_out(e, None) for e in report.misses],
+        invalid=[
+            IntervalReportInvalidOut(
+                commitment_id=e.commitment_id,
+                committed_at=e.committed_at,
+                original_text=e.original_text,
+                reason=e.reason,
+            )
+            for e in report.invalid
+        ],
+    )
 
 
 # --------------------------------------------------------------------------- #

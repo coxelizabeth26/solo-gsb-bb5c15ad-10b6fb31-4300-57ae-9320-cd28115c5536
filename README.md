@@ -67,6 +67,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | GET | `/events/{id}/timeline` | 可核验的事件时间线 |
 | POST | `/events/{id}/settlement` | closed 阶段永久确认标准结果并结算（仅一次） |
 | GET | `/events/{id}/settlement` | 查询结算状态与结果（未结算返回明确状态） |
+| GET | `/events/{id}/interval-report` | 已结算事件的数值区间预测报告（只读，十进制精确覆盖判定与排名） |
 | POST | `/utils/commitment` | 按约定方案计算承诺哈希 |
 | GET | `/health` | 健康检查 |
 
@@ -760,6 +761,83 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 | 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已永久结算，重复结算被拒绝（`detail.conflicts[0].existing` 回显首次结果） |
 | 422 | — | `standard_result` 缺失、为空串或不是字符串；事件 ID 非 UUID |
 
+## 数值区间预测报告（`GET /events/{id}/interval-report`）
+
+对**已结算**事件生成只读的数值区间预测报告：把每条已揭示原文按
+「`下界..上界`」解析为两个**有限十进制数**，用 `decimal.Decimal` 精确判定
+区间是否覆盖结算标准结果，并对命中者排名。接口不修改任何数据，既有结算
+计数（`correct_count` / `incorrect_count` / `unrevealed_count`）原样回显、
+保持不变。
+
+**区间文本语法**（严格匹配，不允许空白、下划线、`Infinity`/`NaN` 等宽松形式）：
+
+```
+interval       := finite_decimal ".." finite_decimal
+finite_decimal := [+-]? ( 数字+ ["." 数字*] | "." 数字+ ) [ (e|E) [+-]? 数字+ ]
+```
+
+- 原文须恰好含一个 `..` 分隔符，两侧均为有限十进制数（如 `1..2`、
+  `-1.5..2.5e1`）；**下界不得大于上界**；
+- 解析失败的揭示单独列入 `invalid` 并注明 `reason`
+  （`INVALID_FORMAT` / `LOWER_BOUND_EXCEEDS_UPPER`）；
+- 从未揭示的承诺不参与解析，单独计入 `unrevealed_commitment_count`；
+- 结算标准结果本身不是有限十进制数时，整个报告返回
+  `422 STANDARD_RESULT_NOT_FINITE_DECIMAL`。
+
+**覆盖判定与排名**（全程十进制精确计算，不经过浮点）：
+
+- 闭区间覆盖：`下界 <= 标准结果 <= 上界`（边界命中算覆盖；`1.10` 与 `1.1`
+  数值相等）；
+- 区间宽度 `width = 上界 - 下界`，为精确十进制字符串（如 `1.4..1.6` 的宽度
+  是 `0.2` 而非浮点近似）；
+- **命中者**按 `(区间宽度, 承诺提交时间, 承诺 ID)` 升序排名，`rank` 从 1 开始；
+- **未命中者**列入 `misses` 但不排名（`rank` 为 `null`），按
+  `(承诺提交时间, 承诺 ID)` 稳定排序。
+
+```bash
+curl -s http://localhost:8000/events/<EVENT_ID>/interval-report
+```
+
+```json
+{
+  "event_id": "<EVENT_ID>",
+  "generated_at": "2030-01-02T00:00:05Z",
+  "standard_result": "1.5",
+  "settled_at": "2030-01-02T00:00:01Z",
+  "correct_count": 0,
+  "incorrect_count": 3,
+  "unrevealed_count": 1,
+  "commitment_count": 4,
+  "revealed_count": 3,
+  "unrevealed_commitment_count": 1,
+  "valid_interval_count": 2,
+  "hit_count": 2,
+  "miss_count": 0,
+  "invalid_count": 1,
+  "hits": [
+    {"commitment_id": "<CID_1>", "committed_at": "2030-01-01T00:10:00Z",
+     "lower_bound": "1.4", "upper_bound": "1.6", "width": "0.2",
+     "hit": true, "rank": 1},
+    {"commitment_id": "<CID_2>", "committed_at": "2030-01-01T00:05:00Z",
+     "lower_bound": "1", "upper_bound": "2", "width": "1",
+     "hit": true, "rank": 2}
+  ],
+  "misses": [],
+  "invalid": [
+    {"commitment_id": "<CID_3>", "committed_at": "2030-01-01T00:20:00Z",
+     "original_text": "not-an-interval", "reason": "INVALID_FORMAT"}
+  ]
+}
+```
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 报告生成成功（纯只读，重复请求结果一致） |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在 |
+| 409 | `INTERVAL_REPORT_NOT_SETTLED` | 事件尚未结算（含 closed 但未结算） |
+| 422 | `STANDARD_RESULT_NOT_FINITE_DECIMAL` | 结算标准结果不是有限十进制数 |
+| 422 | — | 事件 ID 非 UUID |
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -786,6 +864,8 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 | 409 | `SETTLEMENT_NOT_IN_CLOSED_PHASE` | 事件尚未进入 closed 阶段即提交结算 |
 | 409 | `PROOF_NOT_AVAILABLE` | 未过提交截止即请求承诺集合 Merkle 根或成员证明 |
 | 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已永久结算，重复结算被拒绝且不改写既有结果（`detail.conflicts[0].existing` 回显首次结果） |
+| 409 | `INTERVAL_REPORT_NOT_SETTLED` | 数值区间报告仅对已结算事件生成，事件尚未结算 |
+| 422 | `STANDARD_RESULT_NOT_FINITE_DECIMAL` | 结算标准结果不是有限十进制数，无法生成数值区间报告 |
 | 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason、结算标准结果为空） |
 
 「仅首次匹配的揭示生效」由 `reveals.commitment_id` 唯一约束保证：并发揭示同一承诺时，
@@ -849,6 +929,7 @@ app/
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
   merkle.py     # 承诺集合 Merkle 树：叶/内部域前缀、末项复制、成员证明与严格校验（纯函数）
+  intervals.py  # 数值区间预测报告：有限十进制解析、精确覆盖判定与命中排名（纯函数）
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
 tests/test_snapshot.py        # 历史时刻快照：延长回放、阶段与计数重放、400/404 错误
@@ -859,6 +940,7 @@ tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
 tests/test_settlement.py      # 永久结算：精确匹配计数、未结算状态、重复结算冲突与不改写
+tests/test_interval_report.py # 数值区间报告：十进制精确覆盖判定、命中排名、无效/未揭示分类与只读
 tests/test_merkle.py          # Merkle 纯函数：空根/单叶、末项复制、域分离、成员证明与严格层级校验
 tests/test_merkle_proofs_api.py  # 集合证明 API：阶段门禁、根/证明签发、本地校验、404/409 与现有流程不受影响
 Dockerfile

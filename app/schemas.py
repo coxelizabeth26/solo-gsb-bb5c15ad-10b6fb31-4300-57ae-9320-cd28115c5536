@@ -186,6 +186,53 @@ class SettlementOut(BaseModel):
     )
 
 
+class IntervalReportEntryOut(BaseModel):
+    commitment_id: UUID
+    committed_at: datetime = Field(description="承诺提交时间（UTC），同宽时的排名依据之一")
+    lower_bound: str = Field(description="原文中的下界片段（逐字保留）")
+    upper_bound: str = Field(description="原文中的上界片段（逐字保留）")
+    width: str = Field(description="区间宽度（上界 - 下界）的精确十进制表示")
+    hit: bool = Field(description="区间是否覆盖标准结果（闭区间，十进制精确判定）")
+    rank: Optional[int] = Field(
+        description="命中者名次（从 1 开始，按宽度升序，同宽按承诺提交时间、承诺 ID）；未命中为 null"
+    )
+
+
+class IntervalReportInvalidOut(BaseModel):
+    commitment_id: UUID
+    committed_at: datetime = Field(description="承诺提交时间（UTC）")
+    original_text: str = Field(description="无法解析为合法区间的揭示原文")
+    reason: str = Field(
+        description="无效原因：INVALID_FORMAT（不是两个有限十进制数）| LOWER_BOUND_EXCEEDS_UPPER（下界大于上界）"
+    )
+
+
+class IntervalReportOut(BaseModel):
+    event_id: UUID
+    generated_at: datetime
+    standard_result: str = Field(description="已永久确认的结算标准结果（有限十进制数，原文回显）")
+    settled_at: datetime = Field(description="结算永久确认时间（UTC）")
+    correct_count: int = Field(description="结算时固化的正确数（既有结算计数，不被本报告修改）")
+    incorrect_count: int = Field(description="结算时固化的错误数（既有结算计数，不被本报告修改）")
+    unrevealed_count: int = Field(description="结算时固化的未揭示数（既有结算计数，不被本报告修改）")
+    commitment_count: int = Field(description="事件承诺总数")
+    revealed_count: int = Field(description="已揭示承诺数（= 合法区间数 + 无效原文数）")
+    unrevealed_commitment_count: int = Field(description="从未揭示的承诺数（单独计数，不参与解析）")
+    valid_interval_count: int = Field(description="成功解析为合法区间的揭示数（= 命中数 + 未命中数）")
+    hit_count: int = Field(description="覆盖标准结果的区间数")
+    miss_count: int = Field(description="合法但未覆盖标准结果的区间数")
+    invalid_count: int = Field(description="无法解析为合法区间的揭示数")
+    hits: list[IntervalReportEntryOut] = Field(
+        description="命中区间，按 (宽度, 承诺提交时间, 承诺 ID) 升序排名，rank 从 1 开始"
+    )
+    misses: list[IntervalReportEntryOut] = Field(
+        description="未命中区间，按 (承诺提交时间, 承诺 ID) 稳定排序，rank 为 null（不排名）"
+    )
+    invalid: list[IntervalReportInvalidOut] = Field(
+        description="无效揭示原文，按 (承诺提交时间, 承诺 ID) 稳定排序"
+    )
+
+
 class ConflictRequest(BaseModel):
     event_ids: list[UUID] = Field(
         default_factory=list,
