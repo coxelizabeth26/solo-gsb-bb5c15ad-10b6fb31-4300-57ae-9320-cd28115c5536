@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal, Optional
 from uuid import UUID
 
@@ -293,6 +294,56 @@ class CommitmentReuseAuditOut(BaseModel):
 class HashOut(BaseModel):
     commitment_hash: str
     hash_scheme: str
+
+
+class IntervalReportEntryOut(BaseModel):
+    """一条已揭示承诺在区间报告中的解析结果（合法区间）。"""
+
+    commitment_id: UUID
+    committed_at: datetime = Field(description="承诺提交时间（UTC，同宽排名的次序依据）")
+    lower: Decimal = Field(description="区间下界（有限十进制字面量，闭区间）")
+    upper: Decimal = Field(description="区间上界（有限十进制字面量，闭区间）")
+    width: Decimal = Field(description="区间宽度 = 上界 - 下界（十进制精确计算）")
+    hit: bool = Field(description="闭区间是否覆盖标准结果（lower <= standard <= upper）")
+    rank: Optional[int] = Field(
+        default=None,
+        description="命中者的名次（从 1 开始，按宽度升序、同宽按提交时间与承诺 ID）；未命中为 null",
+    )
+
+
+class IntervalReportInvalidOut(BaseModel):
+    """一条无法解析为合法区间的已揭示原文。"""
+
+    commitment_id: UUID
+    committed_at: datetime = Field(description="承诺提交时间（UTC）")
+    original_text: str = Field(description="提交揭示时的原始文本（未做任何裁剪）")
+    reason: Literal["INVALID_FORMAT", "INVALID_ORDER"] = Field(
+        description="INVALID_FORMAT=无法按「下界..上界」解析为两个有限十进制数；"
+        "INVALID_ORDER=下界严格大于上界"
+    )
+
+
+class IntervalReportOut(BaseModel):
+    event_id: UUID
+    status: Literal["settled"] = Field(description="仅已结算事件可生成报告")
+    standard_result: Decimal = Field(
+        description="结算标准结果（必须是有限十进制数，否则端点返回 422，不生成报告）"
+    )
+    settled_at: datetime = Field(description="结算永久确认时间（UTC）")
+    generated_at: datetime = Field(description="报告生成时间（UTC）；报告为只读，不写入任何数据")
+    hit_count: int = Field(description="区间覆盖标准结果的已揭示承诺数（= entries 中 hit=true 的数量）")
+    miss_count: int = Field(description="区间未覆盖标准结果的合法区间数")
+    invalid_count: int = Field(description="原文无法解析为合法区间的已揭示承诺数（= invalids 长度）")
+    unrevealed_count: int = Field(
+        description="从未揭示的承诺数（只计数，不列出；与结算固化的 unrevealed_count 一致）"
+    )
+    entries: list[IntervalReportEntryOut] = Field(
+        description="合法区间条目：命中者在前按名次升序（宽度、提交时间、承诺 ID），"
+        "未命中者随后（提交时间、承诺 ID），rank 为 null"
+    )
+    invalids: list[IntervalReportInvalidOut] = Field(
+        description="非法揭示条目（提交时间、承诺 ID 排序），不计入命中/未命中排名"
+    )
 
 
 class MerkleProofStep(BaseModel):

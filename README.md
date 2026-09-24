@@ -40,7 +40,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 |------|----------|----------|
 | `commit` | 创建时刻 ≤ now < commit_deadline | 提交承诺 |
 | `reveal` | commit_deadline ≤ now < reveal_deadline | 提交揭示 |
-| `closed` | now ≥ reveal_deadline | 只读；提交永久结算、查询结算结果 |
+| `closed` | now ≥ reveal_deadline | 只读；提交永久结算、查询结算结果与数值区间预测报告 |
 
 边界语义：到达 commit_deadline 的瞬间提交通道关闭、揭示通道开启；到达 reveal_deadline 揭示通道关闭，事件进入 closed 阶段，此后可提交一次永久结算。
 
@@ -67,6 +67,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | GET | `/events/{id}/timeline` | 可核验的事件时间线 |
 | POST | `/events/{id}/settlement` | closed 阶段永久确认标准结果并结算（仅一次） |
 | GET | `/events/{id}/settlement` | 查询结算状态与结果（未结算返回明确状态） |
+| GET | `/events/{id}/interval-report` | 已结算事件的数值区间预测只读报告（解析「下界..上界」、命中排名） |
 | POST | `/utils/commitment` | 按约定方案计算承诺哈希 |
 | GET | `/health` | 健康检查 |
 
@@ -760,6 +761,72 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 | 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已永久结算，重复结算被拒绝（`detail.conflicts[0].existing` 回显首次结果） |
 | 422 | — | `standard_result` 缺失、为空串或不是字符串；事件 ID 非 UUID |
 
+## 数值区间预测报告（`GET /events/{id}/interval-report`）
+
+对**已结算**事件生成只读的数值区间预测报告。每条已接受揭示的原文按
+**「下界..上界」**解析为两个有限十进制数（中间恰好一个 `..`，两侧各为
+可选符号、整数/小数、可带指数的十进制字面量，如 `1..10`、`-0.5..0.5`、
+`1e-3..2E1`；不允许空白、下划线或 `Infinity` / `NaN`），并要求
+**下界不得大于上界**。报告用 `Decimal` **十进制精确计算**闭区间覆盖
+（`lower <= standard <= upper`，含边界），不经过二进制浮点——例如标准结果
+`0.3` 与区间 `0.1..0.3` 不会因 `0.1 + 0.2` 的浮点误差而误判。
+
+- **命中排名**：区间覆盖标准结果的承诺按**区间宽度（上界 − 下界）从小到大**
+  排名；同宽按**承诺提交时间**、再按**承诺 ID** 排序，名次从 1 开始连续编号；
+- **未命中者**：合法但不覆盖标准结果的区间照常列出（含边界、宽度、
+  `hit=false`），但 `rank` 为 `null`，统一排在命中者之后（按提交时间、承诺 ID）；
+- **非法原文**：无法解析为两个有限十进制数（`reason=INVALID_FORMAT`）或
+  下界严格大于上界（`reason=INVALID_ORDER`）的已揭示原文单独列入 `invalids`，
+  回显承诺 ID、提交时间与原始文本，**不参与命中与排名**；
+- **未揭示承诺**：单独计入 `unrevealed_count`（与结算固化值一致），不列出；
+- 报告**纯只读**：不写入任何数据，也**不改变既有结算计数**（结算的正确 /
+  错误判定仍按揭示原文与标准结果逐字符精确匹配）。
+
+```bash
+# 已结算（standard_result 必须是有限十进制数）后获取报告
+curl -s http://localhost:8000/events/<EVENT_ID>/interval-report
+```
+
+```json
+{
+  "event_id": "<EVENT_ID>",
+  "status": "settled",
+  "standard_result": "10",
+  "settled_at": "2030-07-01T02:00:01Z",
+  "generated_at": "2030-07-01T03:00:00Z",
+  "hit_count": 3,
+  "miss_count": 1,
+  "invalid_count": 1,
+  "unrevealed_count": 1,
+  "entries": [
+    {"commitment_id": "<ID_点区间>", "committed_at": "2030-07-01T00:03:00Z",
+     "lower": "10", "upper": "10", "width": "0", "hit": true, "rank": 1},
+    {"commitment_id": "<ID_窄区间>", "committed_at": "2030-07-01T00:02:00Z",
+     "lower": "9.5", "upper": "10.5", "width": "1.0", "hit": true, "rank": 2},
+    {"commitment_id": "<ID_宽区间>", "committed_at": "2030-07-01T00:01:00Z",
+     "lower": "0", "upper": "100", "width": "100", "hit": true, "rank": 3},
+    {"commitment_id": "<ID_未命中>", "committed_at": "2030-07-01T00:04:00Z",
+     "lower": "11", "upper": "20", "width": "9", "hit": false, "rank": null}
+  ],
+  "invalids": [
+    {"commitment_id": "<ID_非法>", "committed_at": "2030-07-01T00:05:00Z",
+     "original_text": "oops", "reason": "INVALID_FORMAT"}
+  ]
+}
+```
+
+所有十进制字段（`standard_result` / `lower` / `upper` / `width`）均以
+**字符串**形式返回，调用方可无损地用任意十进制库解析。零承诺事件的报告
+各计数均为 0、两个列表为空。
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 已结算事件的区间报告生成成功 |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在 |
+| 409 | `INTERVAL_REPORT_NOT_SETTLED` | 事件尚未结算（报告仅对已结算事件生成） |
+| 422 | `NON_FINITE_STANDARD_RESULT` | 结算标准结果不是有限十进制数（如 `abc`、`Infinity`、`NaN`、带空白、不是单个数字） |
+| 422 | — | 事件 ID 非 UUID |
+
 ## 错误响应
 
 错误统一返回 `{"detail": {"code": "...", "message": "..."}}`，且**均不改变任何状态**
@@ -784,8 +851,10 @@ curl -s http://localhost:8000/events/<EVENT_ID>/settlement
 | 409 | `DUPLICATE_REVEAL` | 该承诺已被揭示（仅首次匹配生效） |
 | 409 | `BATCH_REVEAL_CONFLICT` | 批量揭示存在逐项冲突（`detail.conflicts` 给出每个冲突项的 index/type 与原文、盐、重算哈希） |
 | 409 | `SETTLEMENT_NOT_IN_CLOSED_PHASE` | 事件尚未进入 closed 阶段即提交结算 |
+| 409 | `INTERVAL_REPORT_NOT_SETTLED` | 事件尚未结算即请求数值区间预测报告 |
 | 409 | `PROOF_NOT_AVAILABLE` | 未过提交截止即请求承诺集合 Merkle 根或成员证明 |
 | 409 | `SETTLEMENT_ALREADY_CONFIRMED` | 事件已永久结算，重复结算被拒绝且不改写既有结果（`detail.conflicts[0].existing` 回显首次结果） |
+| 422 | `NON_FINITE_STANDARD_RESULT` | 区间报告的结算标准结果不是有限十进制数（既有结算与计数不变） |
 | 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason、结算标准结果为空） |
 
 「仅首次匹配的揭示生效」由 `reveals.commitment_id` 唯一约束保证：并发揭示同一承诺时，
@@ -845,6 +914,7 @@ app/
   clock.py      # 统一时钟（阶段判定与记录 created_at 的唯一时间来源，可整体替换）
   conflicts.py  # 阶段窗口 sweep-line 冲突分析（纯函数，可独立单测）
   scheduling.py # 阶段窗口资源排程：最少轨道的确定性区间着色（纯函数，可独立单测）
+  intervals.py  # 数值区间原文解析「下界..上界」与十进制精确命中/宽度计算（纯函数）
   models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions / settlements）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
@@ -859,6 +929,7 @@ tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
 tests/test_settlement.py      # 永久结算：精确匹配计数、未结算状态、重复结算冲突与不改写
+tests/test_interval_report.py # 区间报告：409/422 门禁、「下界..上界」解析、宽度排名与只读
 tests/test_merkle.py          # Merkle 纯函数：空根/单叶、末项复制、域分离、成员证明与严格层级校验
 tests/test_merkle_proofs_api.py  # 集合证明 API：阶段门禁、根/证明签发、本地校验、404/409 与现有流程不受影响
 Dockerfile

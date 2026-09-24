@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
-from . import clock, merkle
+from . import clock, intervals, merkle
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, DeadlineExtension, Event, Reveal, Settlement
@@ -41,6 +41,9 @@ from .schemas import (
     EventOut,
     EventSnapshotOut,
     HashOut,
+    IntervalReportEntryOut,
+    IntervalReportInvalidOut,
+    IntervalReportOut,
     MerkleProofOut,
     MerkleProofStep,
     MerkleProofVerifyRequest,
@@ -1277,6 +1280,113 @@ def get_settlement(event_id: UUID, db: Session = Depends(get_db)):
         db.query(Settlement).filter(Settlement.event_id == event.id).one_or_none()
     )
     return settlement_out(event.id, settlement)
+
+
+@app.get("/events/{event_id}/interval-report", response_model=IntervalReportOut)
+def get_interval_report(event_id: UUID, db: Session = Depends(get_db)):
+    """已结算事件的数值区间预测只读报告。
+
+    仅对**已结算**事件生成：未结算返回 409 INTERVAL_REPORT_NOT_SETTLED，
+    事件不存在返回 404。结算时固化的标准结果必须是一个**有限十进制数**，
+    否则报告无法按数值生成，返回 422 NON_FINITE_STANDARD_RESULT（既有
+    结算结果与计数均不变）。
+
+    每条已揭示原文按「下界..上界」解析：
+
+      - 两侧各为一个有限十进制字面量（可选符号、整数/小数、可带指数），
+        中间恰好一个 ``..``；空白、下划线、``Infinity`` / ``NaN`` 等均为
+        ``INVALID_FORMAT``，单独列入 ``invalids``，不参与命中判定；
+      - 解析成功但下界严格大于上界为 ``INVALID_ORDER``，同样列入 invalids；
+      - 从未揭示的承诺只计入 ``unrevealed_count``（与结算固化值一致）。
+
+    合法区间用十进制（Decimal）精确计算闭区间覆盖
+    ``lower <= standard <= upper``（含边界）。命中者按区间宽度
+    （``upper - lower``）从小到大排名，同宽按承诺提交时间、再按承诺 ID
+    排序，名次从 1 开始连续编号；未命中者在命中者之后列出但不排名
+    （``rank=null``）。报告纯只读，不改变既有结算与任何计数。
+    """
+    event = get_event_or_404(db, event_id)
+    settlement = (
+        db.query(Settlement).filter(Settlement.event_id == event.id).one_or_none()
+    )
+    if settlement is None:
+        raise api_error(
+            409,
+            "INTERVAL_REPORT_NOT_SETTLED",
+            f"事件 {event_id} 尚未结算：数值区间报告仅对已结算事件生成",
+        )
+
+    standard = intervals.parse_decimal(settlement.standard_result)
+    if standard is None:
+        raise api_error(
+            422,
+            "NON_FINITE_STANDARD_RESULT",
+            f"结算标准结果 {settlement.standard_result!r} 不是有限十进制数，"
+            "无法按数值区间生成报告（既有结算结果与计数不变）",
+        )
+
+    # 承诺左连接其（唯一的）揭示，按承诺提交时间、ID 稳定排序；
+    # 在 Python 侧排序以保证 SQLite / PostgreSQL 行为一致
+    rows = (
+        db.query(Commitment, Reveal)
+        .outerjoin(Reveal, Reveal.commitment_id == Commitment.id)
+        .filter(Commitment.event_id == event.id)
+        .all()
+    )
+    rows.sort(key=lambda row: (as_utc(row[0].created_at), row[0].id))
+
+    entries: list[IntervalReportEntryOut] = []
+    invalids: list[IntervalReportInvalidOut] = []
+    unrevealed_count = 0
+    for commitment, reveal in rows:
+        committed_at = as_utc(commitment.created_at)
+        if reveal is None:
+            unrevealed_count += 1
+            continue
+        parsed = intervals.parse_interval(reveal.original_text)
+        if isinstance(parsed, str):
+            invalids.append(
+                IntervalReportInvalidOut(
+                    commitment_id=commitment.id,
+                    committed_at=committed_at,
+                    original_text=reveal.original_text,
+                    reason=parsed,
+                )
+            )
+            continue
+        entries.append(
+            IntervalReportEntryOut(
+                commitment_id=commitment.id,
+                committed_at=committed_at,
+                lower=parsed.lower,
+                upper=parsed.upper,
+                width=parsed.width,
+                hit=parsed.covers(standard),
+            )
+        )
+
+    # 命中者按宽度升序，同宽按提交时间、承诺 ID；未命中者不排名
+    hits = [e for e in entries if e.hit]
+    misses = [e for e in entries if not e.hit]
+    hits.sort(key=lambda e: (e.width, e.committed_at, e.commitment_id))
+    misses.sort(key=lambda e: (e.committed_at, e.commitment_id))
+    for rank, entry in enumerate(hits, start=1):
+        entry.rank = rank
+
+    ordered = hits + misses
+    return IntervalReportOut(
+        event_id=event.id,
+        status="settled",
+        standard_result=standard,
+        settled_at=as_utc(settlement.created_at),
+        generated_at=now_utc(),
+        hit_count=len(hits),
+        miss_count=len(misses),
+        invalid_count=len(invalids),
+        unrevealed_count=unrevealed_count,
+        entries=ordered,
+        invalids=invalids,
+    )
 
 
 # --------------------------------------------------------------------------- #
